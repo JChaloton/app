@@ -1,0 +1,65 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Get a free hosted Postgres database in seconds: `npx create-db`
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model Part {
+  lcscId         String          @id @map("lcsc_id")
+  mpn            String?
+  manufacturer   String?
+  description    String?
+  packageName    String?         @map("package_name")
+  storageLocation String?        @map("storage_location")
+  stockLevel     Int             @default(0) @map("stock_level")
+  priceHistory   PriceHistory[]
+  stockMovements StockMovement[]
+
+  @@map("parts")
+}
+
+model PriceHistory {
+  id         Int      @id @default(autoincrement())
+  partId     String   @map("part_id")
+  quantity   Int?
+  pricePaid  Float    @map("price_paid")
+  orderDate  DateTime @map("order_date")
+  sourceFile String   @map("source_file")
+  part       Part     @relation(fields: [partId], references: [lcscId], onDelete: Cascade)
+
+  @@index([partId, orderDate, id])
+  @@map("price_history")
+}
+
+model Project {
+  id             Int             @id @default(autoincrement())
+  name           String          @unique
+  totalCost      Float           @default(0) @map("total_cost")
+  bomLinesJson   String?         @map("bom_lines_json")
+  buildQuantity  Int             @default(1) @map("build_quantity")
+  stockMovements StockMovement[]
+
+  @@map("projects")
+}
+
+model StockMovement {
+  id            Int      @id @default(autoincrement())
+  partId        String   @map("part_id")
+  projectId     Int?     @map("project_id")
+  quantityDelta Int      @map("quantity_delta")
+  note          String?
+  createdAt     DateTime @default(now()) @map("created_at")
+  part          Part     @relation(fields: [partId], references: [lcscId], onDelete: Cascade)
+  project       Project? @relation(fields: [projectId], references: [id], onDelete: SetNull)
+
+  @@index([partId, createdAt, id])
+  @@index([projectId])
+  @@map("stock_movements")
+}
