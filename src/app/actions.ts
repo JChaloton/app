@@ -109,6 +109,57 @@ function parseInteger(value: FormDataEntryValue | null, fieldLabel: string, fall
   return parsed;
 }
 
+function parseRequiredString(value: FormDataEntryValue | null, fieldLabel: string) {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new Error(`${fieldLabel} is required.`);
+  }
+
+  return value.trim();
+}
+
+function parsePreviewOrderRows(payload: FormDataEntryValue | null) {
+  if (typeof payload !== "string" || !payload.trim()) {
+    throw new Error("Order preview data is missing. Upload the CSV again.");
+  }
+
+  const parsed = JSON.parse(payload);
+
+  if (!Array.isArray(parsed)) {
+    throw new Error("Order preview data is invalid. Upload the CSV again.");
+  }
+
+  return parsed.map((row, index) => {
+    if (!row || typeof row !== "object") {
+      throw new Error(`Preview row ${index + 1} is invalid.`);
+    }
+
+    const lcscId = typeof row.lcscId === "string" ? row.lcscId.trim() : "";
+    const quantity = Number(row.quantity);
+    const unitPrice = Number(row.unitPrice);
+    const orderDate =
+      typeof row.orderDate === "string" ? new Date(row.orderDate) : new Date(Number.NaN);
+
+    if (!lcscId || !Number.isFinite(quantity) || !Number.isFinite(unitPrice)) {
+      throw new Error(`Preview row ${index + 1} is incomplete. Upload the CSV again.`);
+    }
+
+    if (Number.isNaN(orderDate.getTime())) {
+      throw new Error(`Preview row ${index + 1} has an invalid order date.`);
+    }
+
+    return {
+      lcscId,
+      quantity,
+      unitPrice,
+      orderDate,
+      mpn: typeof row.mpn === "string" ? row.mpn : null,
+      manufacturer: typeof row.manufacturer === "string" ? row.manufacturer : null,
+      description: typeof row.description === "string" ? row.description : null,
+      packageName: typeof row.packageName === "string" ? row.packageName : null,
+    };
+  });
+}
+
 function getPartMutationFields(input: {
   mpn: string | null;
   manufacturer: string | null;
@@ -252,10 +303,128 @@ async function buildBomData(
   } satisfies BomData;
 }
 
+function createOrderImportData(
+  records: Awaited<ReturnType<typeof parseOrderCsv>>["records"],
+  sourceFile: string,
+  mode: OrderImportData["mode"],
+): OrderImportData {
+  const touchedParts = new Set(records.map((row) => row.lcscId));
+
+  return {
+    mode,
+    sourceFile,
+    importedRows: records.length,
+    touchedParts: touchedParts.size,
+    lines: records.map((row) => ({
+      lcscId: row.lcscId,
+      quantity: row.quantity,
+      unitPrice: row.unitPrice,
+      orderDate: row.orderDate.toISOString(),
+      mpn: row.mpn,
+      manufacturer: row.manufacturer,
+      description: row.description,
+      packageName: row.packageName,
+    })),
+  };
+}
+
+async function commitOrderImport(
+  records: Awaited<ReturnType<typeof parseOrderCsv>>["records"],
+  sourceFile: string,
+) {
+  await prisma.$transaction(async (tx) => {
+    for (const row of records) {
+      await tx.part.upsert({
+        where: { lcscId: row.lcscId },
+        create: {
+          lcscId: row.lcscId,
+          stockLevel: row.quantity,
+          ...getPartMutationFields(row),
+        },
+        update: {
+          stockLevel: {
+            increment: row.quantity,
+          },
+          ...getPartMutationFields(row),
+        },
+      });
+
+      await tx.priceHistory.create({
+        data: {
+          partId: row.lcscId,
+          quantity: row.quantity,
+          pricePaid: row.unitPrice,
+          orderDate: row.orderDate,
+          sourceFile,
+        },
+      });
+
+      await tx.stockMovement.create({
+        data: {
+          partId: row.lcscId,
+          quantityDelta: row.quantity,
+          note: `Imported from order CSV ${sourceFile}.`,
+        },
+      });
+    }
+  });
+}
+
 export async function importOrderAction(
-  _previousState: ActionState<OrderImportData>,
+  previousState: ActionState<OrderImportData>,
   formData: FormData,
 ): Promise<ActionState<OrderImportData>> {
+  const intent = trimInput(formData.get("intent")) ?? "preview";
+
+  if (intent === "commit") {
+    try {
+      if (formData.get("confirmImport") !== "on") {
+        return createState<OrderImportData>(
+          "error",
+          "Tick the confirmation box before importing stock.",
+          previousState.data,
+          previousState.debug,
+        );
+      }
+
+      const sourceFile = parseRequiredString(formData.get("sourceFile"), "Source file");
+      const records = parsePreviewOrderRows(formData.get("linesJson"));
+
+      if (records.length === 0) {
+        return createState<OrderImportData>(
+          "error",
+          "Order preview is empty. Upload the CSV again.",
+          null,
+        );
+      }
+
+      await commitOrderImport(records, sourceFile);
+
+      revalidatePath("/");
+      revalidatePath("/import");
+      revalidatePath("/parts");
+      revalidatePath("/projects");
+
+      return createState<OrderImportData>(
+        "success",
+        `Imported ${records.length} order rows from ${sourceFile}.`,
+        createOrderImportData(records, sourceFile, "committed"),
+        previousState.debug,
+      );
+    } catch (error) {
+      console.error("Order import failed", error);
+
+      return createState<OrderImportData>(
+        "error",
+        error instanceof Error
+          ? error.message
+          : "Order import failed. Check the debug panel and retry after re-uploading the CSV.",
+        previousState.data,
+        previousState.debug,
+      );
+    }
+  }
+
   const uploaded = await readUploadedCsv(formData, "orderFile");
 
   if (uploaded.error || !uploaded.file || !uploaded.text) {
@@ -277,78 +446,12 @@ export async function importOrderAction(
     );
   }
 
-  try {
-    const touchedParts = new Set<string>();
-
-    await prisma.$transaction(async (tx) => {
-      for (const row of parsed.records) {
-        touchedParts.add(row.lcscId);
-
-        await tx.part.upsert({
-          where: { lcscId: row.lcscId },
-          create: {
-            lcscId: row.lcscId,
-            stockLevel: row.quantity,
-            ...getPartMutationFields(row),
-          },
-          update: {
-            stockLevel: {
-              increment: row.quantity,
-            },
-            ...getPartMutationFields(row),
-          },
-        });
-
-        await tx.priceHistory.create({
-          data: {
-            partId: row.lcscId,
-            quantity: row.quantity,
-            pricePaid: row.unitPrice,
-            orderDate: row.orderDate,
-            sourceFile: uploaded.file.name,
-          },
-        });
-
-        await tx.stockMovement.create({
-          data: {
-            partId: row.lcscId,
-            quantityDelta: row.quantity,
-            note: `Imported from order CSV ${uploaded.file.name}.`,
-          },
-        });
-      }
-    });
-
-    revalidatePath("/");
-    revalidatePath("/import");
-    revalidatePath("/parts");
-    revalidatePath("/projects");
-
-    return createState<OrderImportData>(
-      "success",
-      `Imported ${parsed.records.length} order rows from ${uploaded.file.name}.`,
-      {
-        importedRows: parsed.records.length,
-        touchedParts: touchedParts.size,
-        lines: parsed.records.map((row) => ({
-          lcscId: row.lcscId,
-          quantity: row.quantity,
-          unitPrice: row.unitPrice,
-          orderDate: row.orderDate.toISOString(),
-        })),
-      },
-      parsed.debug,
-    );
-  } catch (error) {
-    console.error("Order import failed", error);
-
-    return createState<OrderImportData>(
-      "error",
-      "Order import failed. Check the debug panel and the server logs for the failing row.",
-      null,
-      parsed.debug,
-    );
-  }
+  return createState<OrderImportData>(
+    "success",
+    `Previewing ${parsed.records.length} order rows from ${uploaded.file.name}. Review them, then confirm the import to update stock.`,
+    createOrderImportData(parsed.records, uploaded.file.name, "preview"),
+    parsed.debug,
+  );
 }
 
 export async function auditCartAction(

@@ -10,7 +10,8 @@ export default function ImportPage() {
         </h1>
         <p className="mt-2 max-w-3xl text-base text-slate-600">
           Supports flexible LCSC headers like `LCSC#`, `LCSC Part Number`, and `LCSC PN`. Each CSV
-          line becomes its own `PriceHistory` row and increments stock.
+          line is previewed first, then becomes its own `PriceHistory` row and increments stock
+          only after confirmation.
         </p>
       </div>
 

@@ -15,9 +15,17 @@ export type OrderImportLine = {
   quantity: number;
   unitPrice: number;
   orderDate: string;
+  mpn: string | null;
+  manufacturer: string | null;
+  description: string | null;
+  packageName: string | null;
 };
 
+export type OrderImportMode = "preview" | "committed";
+
 export type OrderImportData = {
+  mode: OrderImportMode;
+  sourceFile: string;
   importedRows: number;
   touchedParts: number;
   lines: OrderImportLine[];
